@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0"
 clap = { version = "4.5.19", features = ["derive"] }
 futures = "0.3"
+rand = "0.8.5"
 serde = { version = "1.0.210", features = ["std", "derive", "serde_derive"]}
 tarpc = { version = "0.34", features = ["full"] }
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time"] }

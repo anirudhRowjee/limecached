@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::Ipv4Addr};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LogEntry {
@@ -25,21 +25,21 @@ pub enum RaftStates {
 // so that sending data to each peer is easy
 #[derive(Debug, Clone)]
 pub struct Peer {
-    peer_id: i32,
-    peer_connection: RaftConsensusClient,
-    next_index: i32,
-    match_index: i32,
+    pub peer_id: u16,
+    pub peer_connection: RaftConsensusClient,
+    pub next_index: i32,
+    pub match_index: i32,
 }
 
 // All the persistent and non-persistent state that each node needs to have
 #[derive(Debug, Clone)]
 pub struct NodeState {
-    current_term: i32,
-    voted_for: i32,
-    log: Vec<LogEntry>,
-    commit_index: i32,
-    last_applied: i32,
-    peers: HashMap<i32, Peer>,
+    pub current_term: i32,
+    pub voted_for: i32,
+    pub log: Vec<LogEntry>,
+    pub commit_index: i32,
+    pub last_applied: i32,
+    pub peers: HashMap<u16, Peer>,
 }
 
 /*
@@ -79,7 +79,9 @@ pub struct RequestVoteRPCRes {
 
 #[tarpc::service]
 pub trait RaftConsensus {
-    async fn echo(message: String) -> String;
+    // Return the ID of the node
+    async fn echo() -> u16;
     async fn append_entries(req: AppendEntriesRPCReq) -> AppendEntriesRPCRes;
     async fn request_vote(req: RequestVoteRPCReq) -> RequestVoteRPCRes;
+    async fn add_peer(ipaddr: Ipv4Addr) -> bool;
 }
