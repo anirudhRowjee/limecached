@@ -5,13 +5,15 @@ use raft::{NodeState, RaftConsensus, RaftStates};
 use rand::Rng;
 use std::{
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::Arc,
+    time::Duration,
 };
 use stream::StreamExt;
 use tarpc::{
     server::{self, incoming::Incoming, Channel},
     tokio_serde::formats::Json,
 };
+use tokio::sync::Mutex;
 
 pub mod limecached;
 pub mod raft;
@@ -29,6 +31,10 @@ struct Flags {
     /// Sets the port number of the leader
     #[clap(long)]
     leader_port: u16,
+
+    /// Sets the peer ID of the leader
+    #[clap(long)]
+    leader_id: u16,
 
     /// Decides if the current node is launching as a leader node or not
     #[clap(long)]
@@ -52,20 +58,18 @@ async fn main() -> anyhow::Result<()> {
     println!("LAUNCHING RAFT SERVER | {:?}", flags);
 
     let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), flags.port);
+
+    let mut module = limecached::LimecachedNode::new(
+        flags.node_id,
+        flags.port,
+        flags.bootstrap,
+        election_timeout_ms,
+    );
+
     let leader_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), flags.leader_port);
-
-    let mut module =
-        limecached::LimecachedNode::new(flags.node_id, flags.bootstrap, election_timeout_ms);
-
-    let locked_module: Arc<Mutex<limecached::LimecachedNode>> = Arc::new(Mutex::new(module));
+    let locked_module: Arc<tokio::sync::Mutex<limecached::LimecachedNode>> =
+        Arc::new(Mutex::new(module));
     let locked_module_clone = Arc::clone(&locked_module);
-
-    // Initialize the randomized timer that will trigger a leader election if
-    // it isn't cancelled.
-    let election_timer_jh = locked_module
-        .lock()
-        .unwrap()
-        .initiate_heartbeat(election_timeout_ms);
 
     // Initialize taRPC Server
     let server_addr_clone = server_addr.clone();
@@ -88,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
                 // By doing this, we are dereferencing the mutexguard inside
                 // the scope of execution, thus letting it live
                 let shim = LimeCachedShim {
-                    node_ref: Arc::clone(&locked_module),
+                    node_ref: Arc::clone(&locked_module_clone),
                 };
                 channel.execute(shim.serve()).for_each(spawn)
             })
@@ -97,15 +101,36 @@ async fn main() -> anyhow::Result<()> {
             .await;
     });
 
-    // Register all the peers
-    locked_module_clone
-        .lock()
-        .unwrap()
-        .register_peers(flags.peer_ports)
-        .await?;
+    // If we aren't a leader
+    if !flags.bootstrap {
+        tokio::task::spawn(async move {
+            println!("Current node is not a leader!");
+            let mut handle = locked_module.lock().await;
+            // Register ourselves as a peer on the leader
+            handle
+                .create_peer(flags.leader_port, flags.leader_id)
+                .await
+                .unwrap();
+            handle
+                .register_self_with_leader(flags.leader_id)
+                .await
+                .unwrap();
+            println!("Registered leader as peer!");
+            // wait until the election takes place
+        })
+        .await
+        .unwrap();
+    } else {
+        // /shrug this will have to do for now, it takes me this long to start all nodes via the
+        // terminal ;-;
+        // TODO Move this into the heartbeat/election timeout thread
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut handle = locked_module.lock().await;
+        handle.run_election().await;
+    }
 
     server_jh.await.unwrap();
-    election_timer_jh.await.unwrap();
+    // election_timer_jh.await.unwrap();
 
     Ok(())
 }

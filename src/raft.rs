@@ -1,4 +1,7 @@
-use std::{collections::HashMap, net::Ipv4Addr};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, SocketAddrV4},
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LogEntry {
@@ -65,23 +68,29 @@ pub struct AppendEntriesRPCRes {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct RequestVoteRPCReq {
-    term: i32,
-    candidate_id: i32,
-    last_log_index: i32,
-    last_log_term: i32,
+    pub term: i32,
+    pub candidate_id: i32,
+    pub last_log_index: i32,
+    pub last_log_term: i32,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct RequestVoteRPCRes {
-    term: i32,
-    vote_granted: bool,
+    pub node_id: u16,
+    pub term: i32,
+    pub vote_granted: bool,
 }
 
 #[tarpc::service]
 pub trait RaftConsensus {
     // Return the ID of the node
     async fn echo() -> u16;
+
     async fn append_entries(req: AppendEntriesRPCReq) -> AppendEntriesRPCRes;
+
     async fn request_vote(req: RequestVoteRPCReq) -> RequestVoteRPCRes;
-    async fn add_peer(ipaddr: Ipv4Addr) -> bool;
+
+    // RPC To register nodes
+    // send our own IP Address + ID and get back the node ID of the other node
+    async fn add_peer(own_ipaddr: SocketAddrV4, own_id: u16) -> u16;
 }

@@ -7,6 +7,7 @@ use std::{
 
 use serde::ser::Error;
 use tarpc::{client, context, tokio_serde::formats::Json};
+use tokio::task::JoinSet;
 
 use crate::raft::{
     self, AppendEntriesRPCReq, AppendEntriesRPCRes, LogEntry, NodeState, Peer, RaftConsensus,
@@ -15,7 +16,7 @@ use crate::raft::{
 
 #[derive(Clone)]
 pub struct LimeCachedShim {
-    pub node_ref: Arc<Mutex<LimecachedNode>>,
+    pub node_ref: Arc<tokio::sync::Mutex<LimecachedNode>>,
 }
 
 // This is the consensus module
@@ -25,11 +26,12 @@ pub struct LimecachedNode {
     // DO THIS LATER!!!!
 
     // All the raft state for this node
+    own_port: u16,
     node_id: u16,
     pub current_state: RaftStates,
-    raft_state: Arc<Mutex<NodeState>>,
-    logstore: Arc<Mutex<Vec<LogEntry>>>,
-    data: Arc<Mutex<HashMap<String, String>>>,
+    raft_state: NodeState,
+    logstore: Vec<LogEntry>,
+    data: HashMap<String, String>,
 
     election_timeout_ms: i32,
 }
@@ -42,53 +44,105 @@ pub struct LimecachedNode {
 // 2. Reading from the store
 // 3. Snapshots(?) idk
 impl LimecachedNode {
-    pub fn new(id: u16, leader: bool, election_timeout_ms: i32) -> Self {
+    pub fn new(id: u16, own_port: u16, leader: bool, election_timeout_ms: i32) -> Self {
         LimecachedNode {
             node_id: id,
+            own_port,
             current_state: raft::RaftStates::Follower,
-            raft_state: Arc::new(Mutex::new(NodeState {
+            raft_state: NodeState {
                 current_term: 0,
                 voted_for: 0,
                 log: Vec::new(),
                 commit_index: 0,
                 last_applied: 0,
                 peers: HashMap::new(),
-            })),
-            logstore: Arc::new(Mutex::new(Vec::new())),
-            data: Arc::new(Mutex::new(HashMap::new())),
+            },
+            logstore: Vec::new(),
+            data: HashMap::new(),
             election_timeout_ms,
         }
     }
 
-    pub async fn register_peers(&self, peer_ports: Vec<u16>) -> anyhow::Result<()> {
-        // Accept the peer ports
-        for port in peer_ports {
-            let mut transport = tarpc::serde_transport::tcp::connect(
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port),
-                Json::default,
-            );
-            transport.config_mut().max_frame_length(usize::MAX);
-            let client =
-                RaftConsensusClient::new(client::Config::default(), transport.await?).spawn();
-            let node_id = client.echo(context::current()).await?;
-            println!("recieved Echo RPC Response from Node {}", node_id);
-
-            // Update the node state
-            let mut state_handle = self.raft_state.lock().unwrap();
-            let _ = state_handle.peers.insert(
-                node_id,
-                Peer {
-                    peer_id: node_id,
-                    peer_connection: client,
-                    next_index: 0,
-                    match_index: 0,
-                },
-            );
-        }
-        return anyhow::Ok(());
+    // Registers an external node as a peer
+    pub async fn create_peer(&mut self, peer_port: u16, peer_id: u16) -> anyhow::Result<u16> {
+        println!(
+            "[ID:{}] Registering Peer with Port {} ID {}",
+            self.node_id, peer_port, peer_id
+        );
+        let mut transport = tarpc::serde_transport::tcp::connect(
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), peer_port),
+            Json::default,
+        );
+        transport.config_mut().max_frame_length(usize::MAX);
+        let client = RaftConsensusClient::new(client::Config::default(), transport.await?).spawn();
+        let peer = Peer {
+            peer_id,
+            peer_connection: client,
+            next_index: 0,
+            match_index: 0,
+        };
+        self.raft_state.peers.insert(peer_id, peer);
+        Ok(peer_id)
     }
 
-    pub fn run_election() {}
+    pub async fn register_self_with_leader(&mut self, leader_id: u16) -> anyhow::Result<()> {
+        let leader_ref = self.raft_state.peers.get(&leader_id).unwrap();
+        leader_ref
+            .peer_connection
+            .add_peer(
+                tarpc::context::current(),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.own_port),
+                self.node_id,
+            )
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    // Run an election
+    pub async fn run_election(&mut self) {
+        println!("[ID:{}] Running election", self.node_id);
+        // Calculate the minimum number of votes we need
+        let quorum_votes = self.raft_state.peers.len() / 2 + 1;
+        // vote for ourselves
+        let current_votes = 1;
+        self.raft_state.current_term += 1;
+
+        // Create a taskset
+        let mut taskset: JoinSet<RequestVoteRPCRes> = tokio::task::JoinSet::new();
+        let peers = self.raft_state.peers.clone();
+
+        for (_, peer) in peers {
+            let term = self.raft_state.current_term.clone();
+            let candidate_id = self.node_id.clone();
+            println!(
+                "[ID:{}] Requesting Vote from Node {}",
+                self.node_id, peer.peer_id
+            );
+
+            // Send the requestvote RPC
+            taskset.spawn(async move {
+                peer.peer_connection
+                    .request_vote(
+                        tarpc::context::current(),
+                        RequestVoteRPCReq {
+                            term,
+                            candidate_id: candidate_id as i32,
+                            last_log_term: 1,
+                            last_log_index: 1,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            });
+        }
+
+        while let Some(k) = taskset.join_next().await {
+            let res = k.unwrap();
+            println!("Recieved Leader Election Response: {:#?}", res);
+            // TODO Early exit when we
+        }
+    }
 
     // Spawn this on a separate thread, outside of the tokio runtime
     pub fn initiate_heartbeat(&self, election_duration_ms: i32) -> tokio::task::JoinHandle<()> {
@@ -116,7 +170,7 @@ impl LimecachedNode {
 impl RaftConsensus for LimeCachedShim {
     // This is what we need to fill in
     async fn echo(self, _: context::Context) -> u16 {
-        let node_handle = self.node_ref.lock().unwrap();
+        let node_handle = self.node_ref.lock().await;
         println!("[ID:{}] Recieved Echo ...", node_handle.node_id);
         return node_handle.node_id;
     }
@@ -134,10 +188,29 @@ impl RaftConsensus for LimeCachedShim {
         context: ::tarpc::context::Context,
         req: RequestVoteRPCReq,
     ) -> RequestVoteRPCRes {
-        todo!()
+        let node_handle = self.node_ref.lock().await;
+        println!("[ID:{}] recieved Request Vote RPC!", node_handle.node_id);
+        RequestVoteRPCRes {
+            node_id: node_handle.node_id,
+            term: 1,
+            vote_granted: true,
+        }
     }
 
-    async fn add_peer(self, context: ::tarpc::context::Context, ipaddr: Ipv4Addr) -> bool {
-        todo!()
+    // This function registers an external node as a peer
+    // Ideally, new nodes will call this on the leader node (we are assuming that the leader node
+    // port will always be known)
+    async fn add_peer(
+        self,
+        _: tarpc::context::Context,
+        peer_addr: SocketAddrV4,
+        peer_id: u16,
+    ) -> u16 {
+        println!("Recieving add peer RPC!");
+        let other_port = peer_addr.port();
+        let mut node_handle = self.node_ref.lock().await;
+        node_handle.create_peer(other_port, peer_id).await.unwrap();
+        println!("Added other node as Peer!");
+        return node_handle.node_id;
     }
 }
