@@ -4,12 +4,17 @@ use std::{
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum LogEntry {
+pub enum LogType {
     Upsert(String, String),
     Delete(String),
-    // TODO
-    // AddPeer(ID, IPAddress)
-    // RemovePeer(ID, IPAddress)
+    // AddPeer(port, node_id)
+    AddPeer(u16, u16),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LogEntry {
+    entry: LogType,
+    term: u16,
 }
 
 // Node-wide state
@@ -37,9 +42,10 @@ pub struct Peer {
 // All the persistent and non-persistent state that each node needs to have
 #[derive(Debug, Clone)]
 pub struct NodeState {
+    pub is_leader: bool,
     pub current_term: i32,
     pub voted_for: i32,
-    pub log: Vec<LogEntry>,
+    pub log: Vec<LogType>,
     pub commit_index: i32,
     pub last_applied: i32,
     pub peers: HashMap<u16, Peer>,

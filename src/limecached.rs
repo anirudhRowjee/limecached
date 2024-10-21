@@ -10,7 +10,7 @@ use tarpc::{client, context, tokio_serde::formats::Json};
 use tokio::task::JoinSet;
 
 use crate::raft::{
-    self, AppendEntriesRPCReq, AppendEntriesRPCRes, LogEntry, NodeState, Peer, RaftConsensus,
+    self, AppendEntriesRPCReq, AppendEntriesRPCRes, LogType, NodeState, Peer, RaftConsensus,
     RaftConsensusClient, RaftStates, RequestVoteRPCReq, RequestVoteRPCRes,
 };
 
@@ -30,7 +30,7 @@ pub struct LimecachedNode {
     node_id: u16,
     pub current_state: RaftStates,
     raft_state: NodeState,
-    logstore: Vec<LogEntry>,
+    logstore: Vec<LogType>,
     data: HashMap<String, String>,
 
     election_timeout_ms: i32,
@@ -50,6 +50,7 @@ impl LimecachedNode {
             own_port,
             current_state: raft::RaftStates::Follower,
             raft_state: NodeState {
+                is_leader: leader,
                 current_term: 0,
                 voted_for: 0,
                 log: Vec::new(),
@@ -82,6 +83,7 @@ impl LimecachedNode {
             match_index: 0,
         };
         self.raft_state.peers.insert(peer_id, peer);
+        // TODO insert this into the replicated log only if we are the leader
         Ok(peer_id)
     }
 
@@ -102,10 +104,13 @@ impl LimecachedNode {
     // Run an election
     pub async fn run_election(&mut self) {
         println!("[ID:{}] Running election", self.node_id);
+
         // Calculate the minimum number of votes we need
         let quorum_votes = self.raft_state.peers.len() / 2 + 1;
+
         // vote for ourselves
-        let current_votes = 1;
+        let mut current_votes = 1;
+        // Increment the current term
         self.raft_state.current_term += 1;
 
         // Create a taskset
@@ -115,6 +120,9 @@ impl LimecachedNode {
         for (_, peer) in peers {
             let term = self.raft_state.current_term.clone();
             let candidate_id = self.node_id.clone();
+            let last_log_term = self.raft_state.current_term.clone();
+            let last_log_index = self.raft_state.last_applied.clone();
+
             println!(
                 "[ID:{}] Requesting Vote from Node {}",
                 self.node_id, peer.peer_id
@@ -128,8 +136,8 @@ impl LimecachedNode {
                         RequestVoteRPCReq {
                             term,
                             candidate_id: candidate_id as i32,
-                            last_log_term: 1,
-                            last_log_index: 1,
+                            last_log_term,
+                            last_log_index,
                         },
                     )
                     .await
@@ -140,7 +148,17 @@ impl LimecachedNode {
         while let Some(k) = taskset.join_next().await {
             let res = k.unwrap();
             println!("Recieved Leader Election Response: {:#?}", res);
-            // TODO Early exit when we
+            current_votes += {
+                if res.vote_granted {
+                    1
+                } else {
+                    0
+                }
+            };
+            if current_votes == quorum_votes {
+                println!("Look at me! I am the leader now.");
+                self.raft_state.is_leader = true;
+            }
         }
     }
 
@@ -188,12 +206,30 @@ impl RaftConsensus for LimeCachedShim {
         context: ::tarpc::context::Context,
         req: RequestVoteRPCReq,
     ) -> RequestVoteRPCRes {
+        let mut decision = false;
         let node_handle = self.node_ref.lock().await;
         println!("[ID:{}] recieved Request Vote RPC!", node_handle.node_id);
+
+        // Checking if the term is less than the current term (old node trying to become leader)
+        if req.term < node_handle.raft_state.current_term {
+            decision = false;
+        }
+        // Check if we have voted for this node (or nobody else) before
+        let vote_check = node_handle.raft_state.voted_for == req.candidate_id
+            || node_handle.raft_state.voted_for == 0;
+        // AND
+        // log is at least as up to date as our log
+        let log_freshness_check = req.last_log_term >= node_handle.raft_state.current_term
+            && req.last_log_index >= node_handle.raft_state.last_applied;
+        // grant the vote
+        if vote_check && log_freshness_check {
+            decision = true;
+        }
+
         RequestVoteRPCRes {
             node_id: node_handle.node_id,
-            term: 1,
-            vote_granted: true,
+            term: node_handle.raft_state.current_term,
+            vote_granted: decision,
         }
     }
 
