@@ -13,8 +13,9 @@ pub enum LogType {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
-    entry: LogType,
-    term: u16,
+    pub entry: LogType,
+    pub term: u16,
+    pub index: u16,
 }
 
 // Node-wide state
@@ -58,18 +59,18 @@ pub struct NodeState {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct AppendEntriesRPCReq {
-    term: i32,
-    leader_id: i32,
-    prev_log_index: i32,
-    prev_log_term: i32,
-    entries: Vec<LogEntry>,
-    leader_commit_index: i32,
+    pub term: i32,
+    pub leader_id: i32,
+    pub prev_log_index: i32,
+    pub prev_log_term: i32,
+    pub entries: Vec<LogEntry>,
+    pub leader_commit_index: i32,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct AppendEntriesRPCRes {
-    term: i32,
-    success: bool,
+    pub term: i32,
+    pub success: bool,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

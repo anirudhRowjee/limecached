@@ -1,17 +1,17 @@
 use core::time;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::{Ipv4Addr, SocketAddrV4},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
-use serde::ser::Error;
+use anyhow::Error;
 use tarpc::{client, context, tokio_serde::formats::Json};
 use tokio::task::JoinSet;
 
 use crate::raft::{
-    self, AppendEntriesRPCReq, AppendEntriesRPCRes, LogType, NodeState, Peer, RaftConsensus,
-    RaftConsensusClient, RaftStates, RequestVoteRPCReq, RequestVoteRPCRes,
+    self, AppendEntriesRPCReq, AppendEntriesRPCRes, LogEntry, LogType, NodeState, Peer,
+    RaftConsensus, RaftConsensusClient, RaftStates, RequestVoteRPCReq, RequestVoteRPCRes,
 };
 
 #[derive(Clone)]
@@ -22,16 +22,13 @@ pub struct LimeCachedShim {
 // This is the consensus module
 #[derive(Clone)]
 pub struct LimecachedNode {
-    // TODO see if we can move this into the trait definition
-    // DO THIS LATER!!!!
-
     // All the raft state for this node
     own_port: u16,
     node_id: u16,
     pub current_state: RaftStates,
-    raft_state: NodeState,
-    logstore: Vec<LogType>,
-    data: HashMap<String, String>,
+    pub raft_state: NodeState,
+    logstore: Vec<LogEntry>,
+    data: BTreeMap<String, String>,
 
     election_timeout_ms: i32,
 }
@@ -59,7 +56,7 @@ impl LimecachedNode {
                 peers: HashMap::new(),
             },
             logstore: Vec::new(),
-            data: HashMap::new(),
+            data: BTreeMap::new(),
             election_timeout_ms,
         }
     }
@@ -158,6 +155,53 @@ impl LimecachedNode {
             if current_votes == quorum_votes {
                 println!("Look at me! I am the leader now.");
                 self.raft_state.is_leader = true;
+                self.current_state = RaftStates::Leader;
+            }
+        }
+
+        // IF we're the leader, send out empty heartbeat messages to prevent
+        // follower election timers from going off
+        self.send_heartbeat().await;
+    }
+
+    // Function to call appendEntries on all nodes in parallel; abstracting this
+    // because both the heartbeat and the log replication step use this
+    pub async fn send_heartbeat(&mut self) {
+        let mut taskset: JoinSet<AppendEntriesRPCRes> = tokio::task::JoinSet::new();
+        let peers = self.raft_state.peers.clone();
+
+        for (_, peer) in peers {
+            let term = self.raft_state.current_term.clone();
+            let candidate_id = self.node_id.clone();
+            let last_log_term = self.raft_state.current_term.clone();
+            let last_log_index = self.raft_state.last_applied.clone();
+
+            println!(
+                "[ID:{}] Appending Entries to Node {}",
+                self.node_id, peer.peer_id
+            );
+
+            // Send the requestvote RPC
+            taskset.spawn(async move {
+                peer.peer_connection
+                    .append_entries(
+                        tarpc::context::current(),
+                        AppendEntriesRPCReq {
+                            leader_id: candidate_id as i32,
+                            term,
+                            prev_log_index: last_log_index,
+                            prev_log_term: last_log_term,
+                            entries: vec![],
+                            leader_commit_index: 0,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            });
+
+            while let Some(k) = taskset.join_next().await {
+                let res = k.unwrap();
+                println!("Recieved AppendEntries Response: {:#?}", res);
             }
         }
     }
@@ -180,7 +224,29 @@ impl LimecachedNode {
     pub fn initiate_election_timeout() {}
 
     // Write to all the other nodes
-    // pub fn write(key: String, value: String) -> Result<String, Error> {}
+    pub async fn write(&mut self, key: String, value: String) -> anyhow::Result<String, Error> {
+        // if we are a leader, do the following
+        // else, make RPC call on leader
+
+        // 1. add a log entry
+        let new_log_entry = LogEntry {
+            entry: LogType::Upsert(key.clone(), value.clone()),
+            term: self.raft_state.current_term as u16,
+            index: self.raft_state.last_applied as u16 + 1,
+        };
+        self.logstore.push(new_log_entry);
+
+        // 2. initiate replication via AppendEntries (is there some sort of disconnect here? how do
+        //    other nodes know that there's new state here?)
+        // 3. Confirm quorum replication, exit early when possible
+
+        // 2. Commit on local and update last_committed index
+        self.data.insert(key, value.clone()).unwrap();
+        self.raft_state.last_applied += 1;
+
+        // 4. return to user
+        return Ok(value);
+    }
 
     pub fn read() {}
 }
@@ -198,7 +264,17 @@ impl RaftConsensus for LimeCachedShim {
         context: ::tarpc::context::Context,
         req: AppendEntriesRPCReq,
     ) -> AppendEntriesRPCRes {
-        todo!()
+        println!("Recieved Append Entries Request: {:#?}", req);
+        let node_handle = self.node_ref.lock().await;
+        if (req.entries.len() == 0) {
+            println!("Heartbeat from leader recieved!")
+        } else {
+            println!("New Entries from leader recieved!")
+        }
+        AppendEntriesRPCRes {
+            term: node_handle.node_id as i32,
+            success: true,
+        }
     }
 
     async fn request_vote(

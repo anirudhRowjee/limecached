@@ -51,25 +51,25 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Parse the command line argument
     let election_timeout_ms: i32 = rand::thread_rng().gen_range(150..300);
 
+    // Parse the command line arguments
     let flags = Flags::parse();
     println!("LAUNCHING RAFT SERVER | {:?}", flags);
 
     let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), flags.port);
 
-    let mut module = limecached::LimecachedNode::new(
+    let module = limecached::LimecachedNode::new(
         flags.node_id,
         flags.port,
         flags.bootstrap,
         election_timeout_ms,
     );
 
-    let leader_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), flags.leader_port);
     let locked_module: Arc<tokio::sync::Mutex<limecached::LimecachedNode>> =
         Arc::new(Mutex::new(module));
     let locked_module_clone = Arc::clone(&locked_module);
+    let locked_module_timer = Arc::clone(&locked_module);
 
     // Initialize taRPC Server
     let server_addr_clone = server_addr.clone();
@@ -129,8 +129,54 @@ async fn main() -> anyhow::Result<()> {
         handle.run_election().await;
     }
 
+    // Create channels to recieve and send durations
+    let (mut sender, mut reciever) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::time::Duration>();
+
+    let election_jh = tokio::task::spawn(async move {
+        let mut election_interval =
+            tokio::time::interval(Duration::from_millis(election_timeout_ms as u64));
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(10));
+
+        // Initialize the timer in a loop
+        loop {
+            tokio::select! {
+
+                _ = election_interval.tick() => {
+                    // check for leadership under a scoped lock so we don't contend
+                    let is_leader: bool = {
+                        let node_handle = locked_module_timer.lock().await;
+                        node_handle.raft_state.is_leader
+                    };
+                    if !is_leader {
+                        println!("Initiating Leader Election");
+                        let mut node_handle = locked_module_timer.lock().await;
+                        node_handle.run_election().await;
+                    }
+                }
+
+                _ = heartbeat_interval.tick() => {
+                    // check for leadership under a scoped lock so we don't contend
+                    let is_leader: bool = {
+                        let node_handle = locked_module_timer.lock().await;
+                        node_handle.raft_state.is_leader
+                    };
+                    if is_leader {
+                        let mut node_handle = locked_module_timer.lock().await;
+                        println!("Sending Heartbeat");
+                        node_handle.send_heartbeat().await;
+                    }
+                }
+
+                // TODO use this later to change the interval and the default action
+                // when the node state changes
+                _ = reciever.recv() => {}
+            }
+        }
+    });
+
     server_jh.await.unwrap();
-    // election_timer_jh.await.unwrap();
+    election_jh.await.unwrap();
 
     Ok(())
 }
