@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(Mutex::new(module));
     let locked_module_clone = Arc::clone(&locked_module);
     let locked_module_timer = Arc::clone(&locked_module);
+    let locked_module_writetest = Arc::clone(&locked_module);
 
     // Initialize taRPC Server
     let server_addr_clone = server_addr.clone();
@@ -133,10 +134,11 @@ async fn main() -> anyhow::Result<()> {
     let (mut sender, mut reciever) =
         tokio::sync::mpsc::unbounded_channel::<tokio::time::Duration>();
 
-    let election_jh = tokio::task::spawn(async move {
-        let mut election_interval =
-            tokio::time::interval(Duration::from_millis(election_timeout_ms as u64));
-        let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(10));
+    let orchestrator_jh = tokio::task::spawn(async move {
+        let mut election_interval = tokio::time::interval(Duration::from_secs(500));
+        election_interval.tick().await;
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(500));
+        heartbeat_interval.tick().await;
 
         // Initialize the timer in a loop
         loop {
@@ -175,8 +177,29 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // task to test out writing and data replication
+    let write_test_jh = tokio::task::spawn(async move {
+        if flags.bootstrap {
+            let mut write_interval = tokio::time::interval(Duration::from_secs(20));
+            // Fire off the first tick instantly so we can wait later
+            write_interval.tick().await;
+            let mut counter = 1;
+            loop {
+                write_interval.tick().await;
+                let key = format!("KEY-{counter}");
+                let value = format!("VAL-{counter}");
+                {
+                    let mut node_handle = locked_module_writetest.lock().await;
+                    node_handle.write(key, value).await.unwrap();
+                }
+                counter += 1;
+            }
+        }
+    });
+
     server_jh.await.unwrap();
-    election_jh.await.unwrap();
+    orchestrator_jh.await.unwrap();
+    write_test_jh.await.unwrap();
 
     Ok(())
 }

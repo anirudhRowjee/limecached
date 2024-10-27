@@ -167,66 +167,55 @@ impl LimecachedNode {
     // Function to call appendEntries on all nodes in parallel; abstracting this
     // because both the heartbeat and the log replication step use this
     pub async fn send_heartbeat(&mut self) {
+        // TODO Figure out which data to send to which node based on the current
+        // forwarded state
+
         let mut taskset: JoinSet<AppendEntriesRPCRes> = tokio::task::JoinSet::new();
         let peers = self.raft_state.peers.clone();
 
-        for (_, peer) in peers {
-            let term = self.raft_state.current_term.clone();
-            let candidate_id = self.node_id.clone();
-            let last_log_term = self.raft_state.current_term.clone();
-            let last_log_index = self.raft_state.last_applied.clone();
+        for (peer_id, peer) in peers {
+            if peer_id as i32 != self.raft_state.voted_for {
+                let term = self.raft_state.current_term.clone();
+                let candidate_id = self.node_id.clone();
+                let last_log_term = self.raft_state.current_term.clone();
+                let last_log_index = self.raft_state.last_applied.clone();
 
-            println!(
-                "[ID:{}] Appending Entries to Node {}",
-                self.node_id, peer.peer_id
-            );
+                println!(
+                    "[ID:{}] Appending Entries to Node {}",
+                    self.node_id, peer.peer_id
+                );
 
-            // Send the requestvote RPC
-            taskset.spawn(async move {
-                peer.peer_connection
-                    .append_entries(
-                        tarpc::context::current(),
-                        AppendEntriesRPCReq {
-                            leader_id: candidate_id as i32,
-                            term,
-                            prev_log_index: last_log_index,
-                            prev_log_term: last_log_term,
-                            entries: vec![],
-                            leader_commit_index: 0,
-                        },
-                    )
-                    .await
-                    .unwrap()
-            });
-
-            while let Some(k) = taskset.join_next().await {
-                let res = k.unwrap();
-                println!("Recieved AppendEntries Response: {:#?}", res);
+                // Send the requestvote RPC
+                taskset.spawn(async move {
+                    peer.peer_connection
+                        .append_entries(
+                            tarpc::context::current(),
+                            AppendEntriesRPCReq {
+                                leader_id: candidate_id as i32,
+                                term,
+                                prev_log_index: last_log_index,
+                                prev_log_term: last_log_term,
+                                entries: vec![],
+                                leader_commit_index: 0,
+                            },
+                        )
+                        .await
+                        .unwrap()
+                });
             }
+        }
+        while let Some(k) = taskset.join_next().await {
+            let res = k.unwrap();
+            println!("Recieved AppendEntries Response: {:#?}", res);
         }
     }
 
-    // Spawn this on a separate thread, outside of the tokio runtime
-    pub fn initiate_heartbeat(&self, election_duration_ms: i32) -> tokio::task::JoinHandle<()> {
-        let interval = election_duration_ms.clone();
-        let id = self.node_id.clone();
-        let a = tokio::task::spawn(async move {
-            let mut interval = tokio::time::interval(time::Duration::from_millis(interval as u64));
-            loop {
-                interval.tick().await;
-                println!("[ID:{}] Initiating Leader Election", id);
-            }
-        });
-        return a;
-    }
-
-    // Spawn this on a separate thread, outside of the tokio runtime
-    pub fn initiate_election_timeout() {}
-
     // Write to all the other nodes
     pub async fn write(&mut self, key: String, value: String) -> anyhow::Result<String, Error> {
+        let node_id = self.node_id;
+        println!("[ID:{node_id}] Recieved Frontend Write (key, value) = ({key}, {value})");
         // if we are a leader, do the following
-        // else, make RPC call on leader
+        // TODO else, make RPC call on leader
 
         // 1. add a log entry
         let new_log_entry = LogEntry {
@@ -236,19 +225,78 @@ impl LimecachedNode {
         };
         self.logstore.push(new_log_entry);
 
+        // For right now, assume only one entry to be cloned
+        let entries_to_be_cloned = self.logstore.last().unwrap();
+        let quorum_count = self.raft_state.peers.len() / 2 + 1;
+
         // 2. initiate replication via AppendEntries (is there some sort of disconnect here? how do
         //    other nodes know that there's new state here?)
+        let mut taskset: JoinSet<AppendEntriesRPCRes> = tokio::task::JoinSet::new();
+        let peers = self.raft_state.peers.clone();
+
+        for (peer_id, peer) in peers {
+            if peer_id as i32 != self.raft_state.voted_for {
+                let term = self.raft_state.current_term.clone();
+                let candidate_id = self.node_id.clone();
+                let last_log_term = self.raft_state.current_term.clone();
+                let last_log_index = self.raft_state.last_applied.clone();
+                let last_commit_index = self.raft_state.commit_index.clone();
+                let entries = vec![entries_to_be_cloned.clone()];
+                println!(
+                    "[ID:{}] Replicating Write to Node {}",
+                    self.node_id, peer.peer_id
+                );
+                // Send the requestvote RPC
+                taskset.spawn(async move {
+                    peer.peer_connection
+                        .append_entries(
+                            tarpc::context::current(),
+                            AppendEntriesRPCReq {
+                                leader_id: candidate_id as i32,
+                                term,
+                                prev_log_index: last_log_index,
+                                prev_log_term: last_log_term,
+                                entries,
+                                leader_commit_index: last_commit_index,
+                            },
+                        )
+                        .await
+                        .unwrap()
+                });
+            }
+        }
+
+        let mut accepted_count = 1;
         // 3. Confirm quorum replication, exit early when possible
+        while let Some(k) = taskset.join_next().await {
+            let res = k.unwrap();
+            println!("Recieved AppendEntries(Write) Response: {:#?}", res);
+            if res.success {
+                accepted_count += 1;
+                if accepted_count >= quorum_count {
+                    println!("[ID:{}] Quorum replication Confirmed!", self.node_id);
+                    break;
+                }
+            }
+        }
 
         // 2. Commit on local and update last_committed index
-        self.data.insert(key, value.clone()).unwrap();
+        self.data.insert(key, value.clone());
+        self.logstore.clear();
         self.raft_state.last_applied += 1;
+        self.raft_state.commit_index += 1;
 
         // 4. return to user
         return Ok(value);
     }
 
-    pub fn read() {}
+    // read from the local state
+    pub fn read(&mut self, key: String) -> anyhow::Result<String, Error> {
+        match self.data.get(&key) {
+            Some(value) => Ok(value.to_owned()),
+            None => Err(anyhow::Error::msg("could not")),
+        }
+    }
 }
 
 impl RaftConsensus for LimeCachedShim {
@@ -266,13 +314,15 @@ impl RaftConsensus for LimeCachedShim {
     ) -> AppendEntriesRPCRes {
         println!("Recieved Append Entries Request: {:#?}", req);
         let node_handle = self.node_ref.lock().await;
+
         if (req.entries.len() == 0) {
             println!("Heartbeat from leader recieved!")
         } else {
             println!("New Entries from leader recieved!")
         }
+
         AppendEntriesRPCRes {
-            term: node_handle.node_id as i32,
+            term: node_handle.raft_state.current_term as i32,
             success: true,
         }
     }
@@ -283,7 +333,9 @@ impl RaftConsensus for LimeCachedShim {
         req: RequestVoteRPCReq,
     ) -> RequestVoteRPCRes {
         let mut decision = false;
-        let node_handle = self.node_ref.lock().await;
+        let mut node_handle = self.node_ref.lock().await;
+        let own_id = node_handle.node_id;
+        let candidate_id = req.candidate_id;
         println!("[ID:{}] recieved Request Vote RPC!", node_handle.node_id);
 
         // Checking if the term is less than the current term (old node trying to become leader)
@@ -291,7 +343,7 @@ impl RaftConsensus for LimeCachedShim {
             decision = false;
         }
         // Check if we have voted for this node (or nobody else) before
-        let vote_check = node_handle.raft_state.voted_for == req.candidate_id
+        let vote_check = node_handle.raft_state.voted_for == candidate_id
             || node_handle.raft_state.voted_for == 0;
         // AND
         // log is at least as up to date as our log
@@ -300,7 +352,10 @@ impl RaftConsensus for LimeCachedShim {
         // grant the vote
         if vote_check && log_freshness_check {
             decision = true;
+            node_handle.raft_state.voted_for = candidate_id;
         }
+
+        println!("[ID:{own_id}] Responding To RequestVote RPC from node {candidate_id} with response {decision}");
 
         RequestVoteRPCRes {
             node_id: node_handle.node_id,
