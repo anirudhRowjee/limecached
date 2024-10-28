@@ -221,27 +221,47 @@ impl LimecachedNode {
         let new_log_entry = LogEntry {
             entry: LogType::Upsert(key.clone(), value.clone()),
             term: self.raft_state.current_term as u16,
-            index: self.raft_state.last_applied as u16 + 1,
+            index: self.raft_state.commit_index as u16,
         };
-        self.logstore.push(new_log_entry);
 
+        // find the term and index of the latest log entry
+        let mut last_log_term = 0;
+        let mut last_log_index = 0; // TODO see if 0 is a good default value?
+        match self.logstore.last() {
+            Some(log_entry) => {
+                last_log_term = log_entry.term;
+                last_log_index = log_entry.index;
+            }
+            None => {
+                // Inherit the term of the node
+                last_log_term = self.raft_state.current_term as u16;
+            }
+        }
+
+        // This entry should be at self.logstore[commit_index]
+        self.logstore.push(new_log_entry);
         // For right now, assume only one entry to be cloned
         let entries_to_be_cloned = self.logstore.last().unwrap();
-        let quorum_count = self.raft_state.peers.len() / 2 + 1;
 
         // 2. initiate replication via AppendEntries (is there some sort of disconnect here? how do
         //    other nodes know that there's new state here?)
+        let quorum_count = self.raft_state.peers.len() / 2 + 1;
         let mut taskset: JoinSet<AppendEntriesRPCRes> = tokio::task::JoinSet::new();
         let peers = self.raft_state.peers.clone();
 
         for (peer_id, peer) in peers {
             if peer_id as i32 != self.raft_state.voted_for {
+                // Track data to verify our invariants
                 let term = self.raft_state.current_term.clone();
                 let candidate_id = self.node_id.clone();
-                let last_log_term = self.raft_state.current_term.clone();
-                let last_log_index = self.raft_state.last_applied.clone();
+                let current_last_log_term = last_log_term.clone();
+                let current_last_log_index = last_log_index.clone();
+
                 let last_commit_index = self.raft_state.commit_index.clone();
+
+                // See how we can make this
                 let entries = vec![entries_to_be_cloned.clone()];
+
                 println!(
                     "[ID:{}] Replicating Write to Node {}",
                     self.node_id, peer.peer_id
@@ -254,8 +274,8 @@ impl LimecachedNode {
                             AppendEntriesRPCReq {
                                 leader_id: candidate_id as i32,
                                 term,
-                                prev_log_index: last_log_index,
-                                prev_log_term: last_log_term,
+                                prev_log_index: current_last_log_index as i32,
+                                prev_log_term: current_last_log_term as i32,
                                 entries,
                                 leader_commit_index: last_commit_index,
                             },
@@ -279,12 +299,12 @@ impl LimecachedNode {
                 }
             }
         }
+        // TODO what if we Don't have quorum replication?
 
         // 2. Commit on local and update last_committed index
-        self.data.insert(key, value.clone());
-        self.logstore.clear();
-        self.raft_state.last_applied += 1;
         self.raft_state.commit_index += 1;
+        self.data.insert(key, value.clone());
+        self.raft_state.last_applied += 1;
 
         // 4. return to user
         return Ok(value);
@@ -313,12 +333,80 @@ impl RaftConsensus for LimeCachedShim {
         req: AppendEntriesRPCReq,
     ) -> AppendEntriesRPCRes {
         println!("Recieved Append Entries Request: {:#?}", req);
-        let node_handle = self.node_ref.lock().await;
-
-        if (req.entries.len() == 0) {
+        if req.entries.len() == 0 {
             println!("Heartbeat from leader recieved!")
         } else {
             println!("New Entries from leader recieved!")
+        }
+
+        let mut node_handle = self.node_ref.lock().await;
+
+        // 5.1 - check that the terms match
+        if req.term < node_handle.raft_state.current_term {
+            return AppendEntriesRPCRes {
+                term: node_handle.raft_state.current_term as i32,
+                success: false,
+            };
+        }
+
+        // Check that the latest log entires exist and are maintained
+        if req.prev_log_index != 0 {
+            let mut ok = true;
+            match node_handle.logstore.get(req.prev_log_index as usize) {
+                Some(entry) => {
+                    // If the terms and the index match, we're good
+                    // the guarantee is that we have the same data at this point
+                    if entry.term as i32 != req.prev_log_term {
+                        unimplemented!("TODO handle conflicting terms");
+                    } else {
+                        ok = true;
+                    }
+                }
+                None => {
+                    ok = false;
+                }
+            }
+            if !ok {
+                return AppendEntriesRPCRes {
+                    term: node_handle.raft_state.current_term as i32,
+                    success: false,
+                };
+            }
+        }
+
+        // append all new entries to the log
+        let mut entries = req.entries.clone();
+        let mut last_new_index = 0;
+        if req.entries.len() > 0 {
+            node_handle.logstore.append(&mut entries);
+            // This is Guaranteed to never fail, because we are appending an entry right before
+            last_new_index = node_handle.logstore.last().unwrap().index;
+        }
+
+        // See if we need to commit any entries from the log into local storage
+        if req.leader_commit_index > node_handle.raft_state.commit_index {
+            // Compute the new commit index
+            let new_commit_index = std::cmp::min(req.leader_commit_index, last_new_index as i32);
+
+            for i in node_handle.raft_state.commit_index..=new_commit_index {
+                // Edge case: handle the case where the 0th entry doesn't get committed
+                let entry = node_handle.logstore.get(i as usize).unwrap().clone();
+                println!("Committing Log Entry [Index: {i}]=> {:#?}", entry);
+
+                // actually write the entry
+                match &entry.entry {
+                    LogType::Upsert(k, v) => {
+                        node_handle.data.insert(k.clone(), v.clone());
+                    }
+                    LogType::Delete(k) => {
+                        unimplemented!("Have not implemented Deletes yet");
+                    }
+                    LogType::AddPeer(port, id) => {
+                        unimplemented!("Have not implemented AddPeer yet");
+                    }
+                }
+            }
+            node_handle.raft_state.commit_index = new_commit_index;
         }
 
         AppendEntriesRPCRes {
