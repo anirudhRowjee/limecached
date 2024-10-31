@@ -45,13 +45,22 @@ struct Flags {
     peer_ports: Vec<u16>,
 }
 
+pub enum DurationAction {
+    ResetElectionTimer,
+    ChangeTimerInterval(tokio::time::Duration),
+}
+
 async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let election_timeout_ms: i32 = rand::thread_rng().gen_range(150..300);
+    let election_timeout_ms: i32 = rand::thread_rng().gen_range(15..30);
+    println!("Election Timer Interval -> {election_timeout_ms}");
+
+    // Create channel to control the timer
+    let (sender, mut reciever) = tokio::sync::mpsc::unbounded_channel::<DurationAction>();
 
     // Parse the command line arguments
     let flags = Flags::parse();
@@ -64,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         flags.port,
         flags.bootstrap,
         election_timeout_ms,
+        sender,
     );
 
     let locked_module: Arc<tokio::sync::Mutex<limecached::LimecachedNode>> =
@@ -130,14 +140,14 @@ async fn main() -> anyhow::Result<()> {
         handle.run_election().await;
     }
 
-    // Create channels to recieve and send durations
-    let (mut sender, mut reciever) =
-        tokio::sync::mpsc::unbounded_channel::<tokio::time::Duration>();
-
     let orchestrator_jh = tokio::task::spawn(async move {
-        let mut election_interval = tokio::time::interval(Duration::from_secs(500));
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        println!("Initiating timer");
+
+        let mut election_interval =
+            tokio::time::interval(Duration::from_secs(election_timeout_ms as u64));
         election_interval.tick().await;
-        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(500));
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10));
         heartbeat_interval.tick().await;
 
         // Initialize the timer in a loop
@@ -145,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
 
                 _ = election_interval.tick() => {
+                    println!("election timer expired!");
                     // check for leadership under a scoped lock so we don't contend
                     let is_leader: bool = {
                         let node_handle = locked_module_timer.lock().await;
@@ -164,15 +175,23 @@ async fn main() -> anyhow::Result<()> {
                         node_handle.raft_state.is_leader
                     };
                     if is_leader {
-                        let mut node_handle = locked_module_timer.lock().await;
                         println!("Sending Heartbeat");
+                        let mut node_handle = locked_module_timer.lock().await;
                         node_handle.send_heartbeat().await;
                     }
                 }
 
-                // TODO use this later to change the interval and the default action
-                // when the node state changes
-                _ = reciever.recv() => {}
+                event = reciever.recv() => {
+                    match event.unwrap() {
+                            DurationAction::ResetElectionTimer => {
+                                println!("Resetting election timer");
+                                election_interval.reset();
+                            },
+                            DurationAction::ChangeTimerInterval(_) => {
+                            }
+                        }
+                }
+
             }
         }
     });

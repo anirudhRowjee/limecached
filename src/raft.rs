@@ -9,6 +9,7 @@ pub enum LogType {
     Delete(String),
     // AddPeer(port, node_id)
     AddPeer(u16, u16),
+    Sentinel,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

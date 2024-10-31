@@ -9,9 +9,12 @@ use anyhow::Error;
 use tarpc::{client, context, tokio_serde::formats::Json};
 use tokio::task::JoinSet;
 
-use crate::raft::{
-    self, AppendEntriesRPCReq, AppendEntriesRPCRes, LogEntry, LogType, NodeState, Peer,
-    RaftConsensus, RaftConsensusClient, RaftStates, RequestVoteRPCReq, RequestVoteRPCRes,
+use crate::{
+    raft::{
+        self, AppendEntriesRPCReq, AppendEntriesRPCRes, LogEntry, LogType, NodeState, Peer,
+        RaftConsensus, RaftConsensusClient, RaftStates, RequestVoteRPCReq, RequestVoteRPCRes,
+    },
+    DurationAction,
 };
 
 #[derive(Clone)]
@@ -29,8 +32,17 @@ pub struct LimecachedNode {
     pub raft_state: NodeState,
     logstore: Vec<LogEntry>,
     data: BTreeMap<String, String>,
-
+    timer_event_sender: tokio::sync::mpsc::UnboundedSender<DurationAction>,
     election_timeout_ms: i32,
+}
+
+struct LogStore {
+    // backing log store
+    store: Vec<LogEntry>,
+    // total size of all the entries
+    length: Option<u64>,
+    // index until which the log has been committed
+    commit_index: Option<u64>,
 }
 
 // Write node methods for handling actions on top of raft
@@ -41,7 +53,13 @@ pub struct LimecachedNode {
 // 2. Reading from the store
 // 3. Snapshots(?) idk
 impl LimecachedNode {
-    pub fn new(id: u16, own_port: u16, leader: bool, election_timeout_ms: i32) -> Self {
+    pub fn new(
+        id: u16,
+        own_port: u16,
+        leader: bool,
+        election_timeout_ms: i32,
+        timer_sender: tokio::sync::mpsc::UnboundedSender<DurationAction>,
+    ) -> Self {
         LimecachedNode {
             node_id: id,
             own_port,
@@ -50,14 +68,20 @@ impl LimecachedNode {
                 is_leader: leader,
                 current_term: 0,
                 voted_for: 0,
+                // We keep this at 0 because the code is supposed to be 1-indexed
                 log: Vec::new(),
                 commit_index: 0,
                 last_applied: 0,
                 peers: HashMap::new(),
             },
-            logstore: Vec::new(),
+            logstore: vec![LogEntry {
+                entry: LogType::Sentinel,
+                term: 0,
+                index: 0,
+            }],
             data: BTreeMap::new(),
             election_timeout_ms,
+            timer_event_sender: timer_sender,
         }
     }
 
@@ -101,6 +125,10 @@ impl LimecachedNode {
     // Run an election
     pub async fn run_election(&mut self) {
         println!("[ID:{}] Running election", self.node_id);
+
+        self.timer_event_sender
+            .send(DurationAction::ResetElectionTimer)
+            .unwrap();
 
         // Calculate the minimum number of votes we need
         let quorum_votes = self.raft_state.peers.len() / 2 + 1;
@@ -170,39 +198,41 @@ impl LimecachedNode {
         // TODO Figure out which data to send to which node based on the current
         // forwarded state
 
+        self.timer_event_sender
+            .send(DurationAction::ResetElectionTimer)
+            .unwrap();
+
         let mut taskset: JoinSet<AppendEntriesRPCRes> = tokio::task::JoinSet::new();
         let peers = self.raft_state.peers.clone();
 
         for (peer_id, peer) in peers {
-            if peer_id as i32 != self.raft_state.voted_for {
-                let term = self.raft_state.current_term.clone();
-                let candidate_id = self.node_id.clone();
-                let last_log_term = self.raft_state.current_term.clone();
-                let last_log_index = self.raft_state.last_applied.clone();
+            let term = self.raft_state.current_term.clone();
+            let candidate_id = self.node_id.clone();
+            let last_log_term = self.raft_state.current_term.clone();
+            let last_log_index = self.raft_state.last_applied.clone();
 
-                println!(
-                    "[ID:{}] Appending Entries to Node {}",
-                    self.node_id, peer.peer_id
-                );
+            println!(
+                "[ID:{}] Appending Entries to Node {}",
+                self.node_id, peer.peer_id
+            );
 
-                // Send the requestvote RPC
-                taskset.spawn(async move {
-                    peer.peer_connection
-                        .append_entries(
-                            tarpc::context::current(),
-                            AppendEntriesRPCReq {
-                                leader_id: candidate_id as i32,
-                                term,
-                                prev_log_index: last_log_index,
-                                prev_log_term: last_log_term,
-                                entries: vec![],
-                                leader_commit_index: 0,
-                            },
-                        )
-                        .await
-                        .unwrap()
-                });
-            }
+            // Send the requestvote RPC
+            taskset.spawn(async move {
+                peer.peer_connection
+                    .append_entries(
+                        tarpc::context::current(),
+                        AppendEntriesRPCReq {
+                            leader_id: candidate_id as i32,
+                            term,
+                            prev_log_index: last_log_index,
+                            prev_log_term: last_log_term,
+                            entries: vec![],
+                            leader_commit_index: 0,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            });
         }
         while let Some(k) = taskset.join_next().await {
             let res = k.unwrap();
@@ -221,24 +251,30 @@ impl LimecachedNode {
         let new_log_entry = LogEntry {
             entry: LogType::Upsert(key.clone(), value.clone()),
             term: self.raft_state.current_term as u16,
-            index: self.raft_state.commit_index as u16,
+            // increase because array is 1-indexed
+            index: self.raft_state.commit_index as u16 + 1,
         };
 
         // find the term and index of the latest log entry
         let mut last_log_term = 0;
-        let mut last_log_index = 0; // TODO see if 0 is a good default value?
+        let mut last_log_index = 0;
         match self.logstore.last() {
-            Some(log_entry) => {
-                last_log_term = log_entry.term;
-                last_log_index = log_entry.index;
-            }
+            Some(log_entry) => match log_entry.entry {
+                // Ignore the sentinel
+                LogType::Sentinel => {}
+                _ => {
+                    last_log_term = log_entry.term;
+                    last_log_index = log_entry.index;
+                }
+            },
+            // The very first message will be this;
             None => {
                 // Inherit the term of the node
                 last_log_term = self.raft_state.current_term as u16;
             }
         }
 
-        // This entry should be at self.logstore[commit_index]
+        // This entry should be at self.logstore[commit_index + 1]
         self.logstore.push(new_log_entry);
         // For right now, assume only one entry to be cloned
         let entries_to_be_cloned = self.logstore.last().unwrap();
@@ -250,40 +286,38 @@ impl LimecachedNode {
         let peers = self.raft_state.peers.clone();
 
         for (peer_id, peer) in peers {
-            if peer_id as i32 != self.raft_state.voted_for {
-                // Track data to verify our invariants
-                let term = self.raft_state.current_term.clone();
-                let candidate_id = self.node_id.clone();
-                let current_last_log_term = last_log_term.clone();
-                let current_last_log_index = last_log_index.clone();
+            // Track data to verify our invariants
+            let term = self.raft_state.current_term.clone();
+            let candidate_id = self.node_id.clone();
+            let current_last_log_term = last_log_term.clone();
+            let current_last_log_index = last_log_index.clone();
 
-                let last_commit_index = self.raft_state.commit_index.clone();
+            let last_commit_index = self.raft_state.commit_index.clone();
 
-                // See how we can make this
-                let entries = vec![entries_to_be_cloned.clone()];
+            // See how we can make this
+            let entries = vec![entries_to_be_cloned.clone()];
 
-                println!(
-                    "[ID:{}] Replicating Write to Node {}",
-                    self.node_id, peer.peer_id
-                );
-                // Send the requestvote RPC
-                taskset.spawn(async move {
-                    peer.peer_connection
-                        .append_entries(
-                            tarpc::context::current(),
-                            AppendEntriesRPCReq {
-                                leader_id: candidate_id as i32,
-                                term,
-                                prev_log_index: current_last_log_index as i32,
-                                prev_log_term: current_last_log_term as i32,
-                                entries,
-                                leader_commit_index: last_commit_index,
-                            },
-                        )
-                        .await
-                        .unwrap()
-                });
-            }
+            println!(
+                "[ID:{}] Replicating Write to Node {}",
+                self.node_id, peer.peer_id
+            );
+            // Send the requestvote RPC
+            taskset.spawn(async move {
+                peer.peer_connection
+                    .append_entries(
+                        tarpc::context::current(),
+                        AppendEntriesRPCReq {
+                            leader_id: candidate_id as i32,
+                            term,
+                            prev_log_index: current_last_log_index as i32,
+                            prev_log_term: current_last_log_term as i32,
+                            entries,
+                            leader_commit_index: last_commit_index,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            });
         }
 
         let mut accepted_count = 1;
@@ -340,73 +374,99 @@ impl RaftConsensus for LimeCachedShim {
         }
 
         let mut node_handle = self.node_ref.lock().await;
+        node_handle
+            .timer_event_sender
+            .send(DurationAction::ResetElectionTimer)
+            .unwrap();
 
         // 5.1 - check that the terms match
         if req.term < node_handle.raft_state.current_term {
+            println!("Term Mismatch!");
             return AppendEntriesRPCRes {
                 term: node_handle.raft_state.current_term as i32,
                 success: false,
             };
         }
 
-        // Check that the latest log entires exist and are maintained
-        if req.prev_log_index != 0 {
+        // If this is not a heartbeat,
+        if req.entries.len() != 0 {
+            // Check that the latest log entires exist and are maintained
             let mut ok = true;
-            match node_handle.logstore.get(req.prev_log_index as usize) {
-                Some(entry) => {
-                    // If the terms and the index match, we're good
-                    // the guarantee is that we have the same data at this point
-                    if entry.term as i32 != req.prev_log_term {
-                        unimplemented!("TODO handle conflicting terms");
-                    } else {
-                        ok = true;
+            // If there is no entry in the log yet, then we can't check this
+            println!("DEBUG CHECK OF LOG : {:#?}", node_handle.logstore);
+            if req.prev_log_index != 0 {
+                match node_handle.logstore.get(req.prev_log_index as usize) {
+                    Some(entry) => {
+                        // If the terms and the index match, we're good
+                        // the guarantee is that we have the same data at this point
+                        if entry.term as i32 != req.prev_log_term {
+                            ok = false;
+                            unimplemented!("TODO handle conflicting terms");
+                        } else {
+                            ok = true;
+                        }
+                    }
+                    None => {
+                        println!("No entry at the back of the log!");
+                        ok = false;
                     }
                 }
-                None => {
-                    ok = false;
-                }
             }
+
             if !ok {
+                println!("No matching entries!");
                 return AppendEntriesRPCRes {
                     term: node_handle.raft_state.current_term as i32,
                     success: false,
                 };
             }
-        }
 
-        // append all new entries to the log
-        let mut entries = req.entries.clone();
-        let mut last_new_index = 0;
-        if req.entries.len() > 0 {
+            // append all new entries to the log
+            let mut entries = req.entries.clone();
+            println!("Appending to log {:#?}", entries);
+            let mut last_new_index = 0;
+
             node_handle.logstore.append(&mut entries);
-            // This is Guaranteed to never fail, because we are appending an entry right before
             last_new_index = node_handle.logstore.last().unwrap().index;
-        }
 
-        // See if we need to commit any entries from the log into local storage
-        if req.leader_commit_index > node_handle.raft_state.commit_index {
-            // Compute the new commit index
-            let new_commit_index = std::cmp::min(req.leader_commit_index, last_new_index as i32);
+            // See if we need to commit any entries from the log into local storage
+            println!("Checking to see if there are uncommitted entries");
+            if req.leader_commit_index > node_handle.raft_state.commit_index {
+                println!("Beginning write process...");
+                // Compute the new commit index
+                let new_commit_index =
+                    std::cmp::min(req.leader_commit_index, last_new_index as i32);
+                println!("new committ index {new_commit_index}");
 
-            for i in node_handle.raft_state.commit_index..=new_commit_index {
-                // Edge case: handle the case where the 0th entry doesn't get committed
-                let entry = node_handle.logstore.get(i as usize).unwrap().clone();
-                println!("Committing Log Entry [Index: {i}]=> {:#?}", entry);
+                let new_writes: bool = node_handle.raft_state.commit_index < new_commit_index;
+                println!(
+                    "new writes verdict -> {new_writes} | local CI  {} computed CI {}",
+                    node_handle.raft_state.commit_index, new_commit_index
+                );
+                if new_writes {
+                    for i in node_handle.raft_state.commit_index + 1..=new_commit_index {
+                        // Edge case: handle the case where the 0th entry doesn't get committed
+                        let entry = node_handle.logstore.get(i as usize).unwrap().clone();
+                        println!("Committing Log Entry [Index: {i}]=> {:#?}", entry);
 
-                // actually write the entry
-                match &entry.entry {
-                    LogType::Upsert(k, v) => {
-                        node_handle.data.insert(k.clone(), v.clone());
+                        // actually write the entry
+                        match &entry.entry {
+                            LogType::Upsert(k, v) => {
+                                node_handle.data.insert(k.clone(), v.clone());
+                            }
+                            LogType::Delete(k) => {
+                                unimplemented!("Have not implemented Deletes yet");
+                            }
+                            LogType::AddPeer(port, id) => {
+                                unimplemented!("Have not implemented AddPeer yet");
+                            }
+                            _ => {}
+                        }
                     }
-                    LogType::Delete(k) => {
-                        unimplemented!("Have not implemented Deletes yet");
-                    }
-                    LogType::AddPeer(port, id) => {
-                        unimplemented!("Have not implemented AddPeer yet");
-                    }
+                    node_handle.raft_state.commit_index = new_commit_index;
                 }
             }
-            node_handle.raft_state.commit_index = new_commit_index;
+            println!("Finished Checking to see if there are uncommitted entries");
         }
 
         AppendEntriesRPCRes {
@@ -465,6 +525,7 @@ impl RaftConsensus for LimeCachedShim {
         let other_port = peer_addr.port();
         let mut node_handle = self.node_ref.lock().await;
         node_handle.create_peer(other_port, peer_id).await.unwrap();
+        // TODO Persist this information to the replicated log
         println!("Added other node as Peer!");
         return node_handle.node_id;
     }
