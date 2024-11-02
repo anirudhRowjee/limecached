@@ -105,6 +105,16 @@ impl LimecachedNode {
         };
         self.raft_state.peers.insert(peer_id, peer);
         // TODO insert this into the replicated log only if we are the leader
+        if self.raft_state.is_leader {
+            self.raft_state.last_applied += 1;
+            let new_log_entry = LogEntry {
+                entry: LogType::AddPeer(peer_port, peer_id),
+                term: self.raft_state.current_term as u16,
+                index: self.raft_state.last_applied as u16,
+            };
+            self.logstore.push(new_log_entry);
+        }
+
         Ok(peer_id)
     }
 
@@ -209,7 +219,7 @@ impl LimecachedNode {
             let term = self.raft_state.current_term.clone();
             let candidate_id = self.node_id.clone();
             let last_log_term = self.raft_state.current_term.clone();
-            let last_log_index = self.raft_state.last_applied.clone();
+            let last_log_index = self.raft_state.commit_index.clone();
 
             println!(
                 "[ID:{}] Appending Entries to Node {}",
@@ -244,17 +254,9 @@ impl LimecachedNode {
     pub async fn write(&mut self, key: String, value: String) -> anyhow::Result<String, Error> {
         let node_id = self.node_id;
         println!("[ID:{node_id}] Recieved Frontend Write (key, value) = ({key}, {value})");
-        // if we are a leader, do the following
-        // TODO else, make RPC call on leader
 
-        // 1. add a log entry
-        let new_log_entry = LogEntry {
-            entry: LogType::Upsert(key.clone(), value.clone()),
-            term: self.raft_state.current_term as u16,
-            // increase because array is 1-indexed
-            index: self.raft_state.commit_index as u16 + 1,
-        };
-
+        // TODO if we are a leader, do the following else, make RPC call on leader
+        //
         // find the term and index of the latest log entry
         let mut last_log_term = 0;
         let mut last_log_index = 0;
@@ -274,10 +276,24 @@ impl LimecachedNode {
             }
         }
 
-        // This entry should be at self.logstore[commit_index + 1]
+        // 1. add a log entry
+        self.raft_state.last_applied += 1;
+        let new_log_entry = LogEntry {
+            entry: LogType::Upsert(key.clone(), value.clone()),
+            term: self.raft_state.current_term as u16,
+            index: self.raft_state.last_applied as u16,
+        };
+        // This entry should be at self.logstore[last_applied + 1]
         self.logstore.push(new_log_entry);
-        // For right now, assume only one entry to be cloned
-        let entries_to_be_cloned = self.logstore.last().unwrap();
+
+        let replication_start_idx = self.raft_state.commit_index + 1;
+        let replication_end_idx = self.raft_state.last_applied;
+        let mut entries_to_be_replicated = Vec::new();
+        for x in replication_start_idx..=replication_end_idx {
+            let local_entry = self.logstore.get(x as usize).unwrap();
+            entries_to_be_replicated.push(local_entry.clone());
+        }
+        println!("Replicating batch => {:#?}", entries_to_be_replicated);
 
         // 2. initiate replication via AppendEntries (is there some sort of disconnect here? how do
         //    other nodes know that there's new state here?)
@@ -295,7 +311,7 @@ impl LimecachedNode {
             let last_commit_index = self.raft_state.commit_index.clone();
 
             // See how we can make this
-            let entries = vec![entries_to_be_cloned.clone()];
+            let entries = entries_to_be_replicated.clone();
 
             println!(
                 "[ID:{}] Replicating Write to Node {}",
@@ -336,9 +352,10 @@ impl LimecachedNode {
         // TODO what if we Don't have quorum replication?
 
         // 2. Commit on local and update last_committed index
-        self.raft_state.commit_index += 1;
+        self.raft_state.commit_index += entries_to_be_replicated.len() as i32;
+        // We are assuming that the rest of the data has already been persisted if it's in the log
+        println!("Committing to local state => {key} | {value}");
         self.data.insert(key, value.clone());
-        self.raft_state.last_applied += 1;
 
         // 4. return to user
         return Ok(value);
@@ -408,7 +425,7 @@ impl RaftConsensus for LimeCachedShim {
                     }
                     None => {
                         println!("No entry at the back of the log!");
-                        ok = false;
+                        // ok = false;
                     }
                 }
             }
@@ -431,7 +448,7 @@ impl RaftConsensus for LimeCachedShim {
 
             // See if we need to commit any entries from the log into local storage
             println!("Checking to see if there are uncommitted entries");
-            if req.leader_commit_index > node_handle.raft_state.commit_index {
+            if req.leader_commit_index > node_handle.raft_state.last_applied {
                 println!("Beginning write process...");
                 // Compute the new commit index
                 let new_commit_index =
@@ -458,7 +475,8 @@ impl RaftConsensus for LimeCachedShim {
                                 unimplemented!("Have not implemented Deletes yet");
                             }
                             LogType::AddPeer(port, id) => {
-                                unimplemented!("Have not implemented AddPeer yet");
+                                println!("Adding Peers with port {port} and ID {id}");
+                                node_handle.create_peer(*port, *id).await.unwrap();
                             }
                             _ => {}
                         }
