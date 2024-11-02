@@ -2,16 +2,29 @@
 
 limecached is an in-memory, raft-backed key-value store.
 
+## The State of the Project
+
+Right now, both the `AppendEntries` and the `RequestVote` RPC are in place. There is a heartbeat timer, as well as an election timer, that runs at a decided interval. In the steady state, the nodes will start, a leader will be elected, and the leader will happily keep replicating log entries to the follower nodes. 
+
+If the leader is killed, one of the nodes will convert itself to leader first, and then initiate an election. However, given that the nodes don't know about each other, it can't ask anyone for a vote. This is because of the current design of the peer discovery mechanism.
+
+```
+   A
+  / \
+ B-!-C
+```
+
 ## Usage Instructions
 
 ```bash
 $ cargo build
 ```
 
-## The State of the Project
 
-Right now, there is only a shell of the `RequestVote` RPC implemented - The messages are just being sent, there's no verification or anything being done. The `AppendEntries` RPC needs to be implemented too.
 
+## Getting started
+
+Open three terminals.
 
 On the leader terminal,
 ```
@@ -55,7 +68,7 @@ Registered leader as peer!
 ```
 
 ## Leader election
-After about 10 seconds, the leader should initiate a leader election. As of right now, these will always return true.
+After about 10 seconds, the leader should initiate a leader election. 
 
 ```
 [ID:1] Running election
@@ -73,3 +86,4 @@ Recieved Leader Election Response: RequestVoteRPCRes {
 }
 ```
 
+After this, the leader will keep replicating log entries to the follower nodes.
